@@ -1,0 +1,21 @@
+# build output
+*.asi
+*.dll
+*.o
+*.obj
+*.pdb
+build/
+out/
+
+# logs and local artefacts
+*.log
+*.dmp
+*.DMP
+*.7z
+*.bak
+build-test.asi
+
+# editors
+.vs/
+.vscode/
+*.user
