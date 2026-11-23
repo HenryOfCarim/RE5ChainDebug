@@ -2,6 +2,62 @@
 
 All notable changes to this project. Dates are local build dates.
 
+## 1.1.3 — fast discovery on the packed build
+
+- The packed build's class object (`0x00F6D534`) is now a profile, so the fast path finds its
+  chains directly instead of waiting for a structural scan.
+- A class object learned by the structural route is remembered (`g_learnedVt`), so rescans
+  after a level change stay on the fast path.
+- The class-object pass now uses the wide region filter too; the old narrow filter skipped
+  the large pool the packed build allocates its objects from.
+- Loaded rChain resources are cached: retries repeat only the pointer pass, and the cache is
+  dropped when a level change makes it stale.
+- All resources are matched in a single pointer pass instead of one pass per resource, and
+  the retry interval is 5 s instead of 10–30 s.
+- Log: `reusing N cached rChain resource(s)`, `learned uChain class object …`,
+  `scan: no uChain points to the cached resources`.
+
+## 1.1.2 — candidates are scored by their joints
+
+- **Fix (why the chain was still not found after 1.1.1):** `InitJoints()` limited its walk to
+  `g_chainJoints`, which is still 0 while the first candidate is being scored. Every
+  structural candidate therefore counted 0 joints, and since `mpColJointWMat` is null on PC
+  the score was 0 and the real chain was rejected. The log shows exactly that:
+  `rChain resource #0 … chn resources=2` followed by `cand … joints=0 score=0`.
+- `ScoreChain()` now weighs joints and only uses the (usually null) col-matrix array as a
+  tie-breaker; a candidate needs at least one valid `JointWork` to be accepted.
+- If a candidate scores 0, `AutoLayout()` re-probes the `JointWork**` / col-matrix offsets and
+  the candidate is rescored; a rejected candidate is hexdumped once (`rej+000: …`) so the
+  next log shows what the object actually is.
+
+## 1.1.1 — the packed build's memory is actually searched
+
+- **Fix (why only the red square was drawn on the Enigma-packed exe):** the structural pass
+  only looked at `MEM_PRIVATE` regions of at most 64 MB above 32 MB. A log from the packed
+  build (`image 00400000-01D29000`) showed `scan: 226 MB … magic=0` — the loaded `rChain`
+  resources were outside that filter, so nothing was ever found.
+- The structural pass is now wide: every committed readable region except the game image,
+  including `MEM_MAPPED` data and large private pools. The class-object (fast path) scan keeps
+  the narrow filter so it stays cheap.
+- Diagnostics: one-shot `mem: private/mapped/image` summary, per-scan coverage
+  (`… MB in … regions, rpe fails, image skipped`), and `magic … rejected: version …` when a
+  header exists but its engine version is not supported.
+- Documentation updated for the two passes.
+
+## 1.1.0 — multi-build support (1.10, 1.20, protected exe)
+
+- `uChain` / `uChainEx` are created by the engine at runtime, so their addresses are build
+  data. They moved into a profile table (`g_chainVtProfiles`) with the 1.10
+  (`0x010B789C` / `0x00F6DEEC`) and 1.20 (`0x010B0E48` / `0x00F6DC54`) pairs; the latter was
+  read from the `uChain` constructor at `0x222A30` of the 14 306 816-byte build.
+- **Fix:** `ChainStillAlive()` required the exact profile address, so on any build with a
+  different address the chain was declared dead every 120 frames and the overlay never drew.
+  Liveness now checks the `rChain` magic (and a plausible class pointer) only.
+- The scanner logs the image range and, per profile, whether its class objects exist in the
+  process (`usable` / `not this build`); an unknown build falls back to the structural
+  `rChain` route instead of relying on a profile.
+- `docs/ARCHITECTURE.md` documents the profile table and how each address was established.
+
 ## 1.0.1 — CCL stability and degenerate joints
 
 - CCL primitives no longer disappear while the character moves: the model-bone proximity

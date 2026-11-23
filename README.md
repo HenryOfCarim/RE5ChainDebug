@@ -26,11 +26,15 @@ rest pose, and the ids (`ref_joint_no`) of the worst joints are drawn next to th
 | | |
 |---|---|
 | game | Resident Evil 5 PC (Steam), `re5dx9.exe` **1.10**, 15 046 608 bytes, MD5 `553fdbb0afb20ac73b8ee44bd9361128` |
+| also works | 1.20 build (14 306 816 bytes) and, through the structural route, other 1.0.0.129-derived builds, including the packed/protected one |
 | loader | any 32-bit ASI loader (e.g. `dinput8.dll` style loader or a mod manager that supports ASI) |
 | build | i686 GCC (TDM-GCC / mingw-w64), no external libraries |
 
-> The packed Enigma-protected build of the game has different addresses and is not
-> supported: the tool locates objects by vtable, but the fixed offsets below are from 1.10.
+> The `uChain` / `uChainEx` class objects are created by the engine at runtime, so their
+> addresses belong to a build, not to the `.exe` layout. The tool carries a small profile
+> table (`1.10` and `1.20`) for the fast scan, and falls back to the structural route
+> (`rChain` magic in the heap) for any other build, including protected ones. Builds that
+> are packed are fine: the ASI never patches game code, only `d3d9.dll` exports.
 
 ## Install
 
@@ -70,8 +74,20 @@ No D3DX, no ImGui, no runtime dependencies beyond `d3d9.dll`/`kernel32`.
 | `base=… delta=…` | module base and its delta from 0x400000 (ASLR) |
 | `d3d9 Direct3DCreate9 patched` / `intercepted` | `d3d9.dll` export hook installed |
 | `scan thread started` / `scan thread done` | background chain search (restarted after a level change) |
-| `vtable route: N candidate object(s)` | objects whose vtable is `uChain`/`uChainEx` |
-| `vtable cand … joints=… prims=… camDist=…` | candidate with its chain/resource statistics |
+| `mem: private/mapped/image …` | one-shot map of the process: regions, total MB, largest region per type |
+| `scan: … MB in … regions (rpe fails …, image skipped … MB), magic=… versioned=… rejected=…` | what the structural pass covered and what it found |
+| `magic … rejected: version …` | a `CHN`/`CCL` header from an unsupported engine branch was seen |
+| `vtable route: N candidate object(s)` | objects whose class pointer matches a known build profile |
+| `image … (… MB)` | game image range, logged once when the scanner starts |
+| `vt profile N (…): uChain=… -> […] usable` / `not this build` | which profile's class objects exist in this process |
+| `build: … uChain vt=…` | profile that produced the current chain |
+| `no known uChain profile matches - using the structural rChain route only` | unknown build; discovery goes through the heap scan |
+| `rChain resource #N at … (data_size=…)` | a loaded `.chn` resource was found in memory |
+| `scan: reusing N cached rChain resource(s)` | the resources did not change, only the pointer pass is repeated |
+| `learned uChain class object …` | the class-object value of this build was recorded for the fast path |
+| `cand res#N chain=… vt=… jw=… jmat=… joints=… score=…` | candidate `uChain` from the structural route, with its joint count |
+| `reject candidate …: no joints` | the pointer hit is not a chain; it is hexdumped once |
+| `layout: rescoring … with auto-detected offsets` | the candidate is re-probed when the default field offsets do not fit |
 | `uChain chosen …` | selected chain (nearest to the camera) |
 | `counts: res=… hdr=… nch=…` | `rChain` header |
 | `counts: joints=N (chaininfo=… block=…) prims=M` | joint/primitive counts actually resolved |
@@ -94,8 +110,13 @@ No D3DX, no ImGui, no runtime dependencies beyond `d3d9.dll`/`kernel32`.
 1. `Direct3DCreate9` is patched inside the `d3d9.dll` export with a 5-byte jump (IAT hooks
    are not used: the packed executable breaks them). `CreateDevice`, `Present`, `Reset` and
    `SetVertexShaderConstantF` are hooked through their vtables.
-2. A background thread scans **private heap** memory for `uChain`/`uChainEx` vtables, then
+2. A background thread scans **committed readable memory** (everything but the game image) for
+   the known `uChain`/`uChainEx` class objects (one profile per supported build), then
    validates each candidate through `mpChain` → `rChain` magic `CHN\0` and version `0x80618`.
+   When no profile matches the running build, the same validation is reached structurally: the
+   scanner finds the `CHN\0` header itself and then every pointer to it, so no build-specific
+   address is needed. The structural pass covers `MEM_MAPPED` data and large private pools too
+   (the packed build keeps its level data there), and the log reports what was searched.
 3. The chain nearest to the camera is selected (the player), joints are counted from the
    contiguous `JointWork` block (stride `0x1D0`), not from `ChainInfo`.
 4. CCL primitives come from `mpCollision` → `rChainCol`; each primitive is attached to a
@@ -117,7 +138,12 @@ No D3DX, no ImGui, no runtime dependencies beyond `d3d9.dll`/`kernel32`.
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 The `.chn` format and every tuning parameter: [docs/CHN_FORMAT.md](docs/CHN_FORMAT.md).
 
-## Verified offsets (PC 1.10)
+## Verified offsets
+
+Class layouts are the same across the 1.0.0.129 builds tested (1.10, 1.20 and the protected
+one); only the runtime class objects differ, and they are handled by the profile table.
+Verified by disassembling the `uChain` constructor of each build (`0x211CD0` in 1.10,
+`0x222A30` in 1.20), which zeroes exactly these fields.
 
 | field | offset |
 |---|---|
@@ -139,7 +165,9 @@ The `.chn` format and every tuning parameter: [docs/CHN_FORMAT.md](docs/CHN_FORM
 
 ## Limitations
 
-- exe 1.10 only.
+- Tested on 1.10; 1.20 and the protected build are supported by construction (same class
+  layouts, structural discovery) but need a run on that build to confirm the projection and
+  camera calibration. The log now states which profile matched, if any.
 - Main menu has no chains — the indicator stays red there, that is expected.
 - If several characters carry chains, the nearest to the camera wins.
 - The projection calibration may flip convention in an unusual scene; the sanity guard

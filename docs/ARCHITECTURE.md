@@ -27,21 +27,53 @@ This is safe with multiple devices and survives re-creation. From the returned
 
 ## 2. Finding the chain
 
-A background thread scans **private committed memory only** (`MEM_PRIVATE`, region
-`<= 64 MB`, `base >= 0x02000000`; the module image and file mappings are skipped). Reads go
-through `ReadProcessMemory`, so a region that disappears mid-scan is an error, not a crash.
+A background thread scans committed, readable memory with `ReadProcessMemory`, so a region
+that disappears mid-scan is an error, not a crash. Only the game image is excluded. There are
+two passes:
 
-A candidate is a dword equal to `uChainEx` (`0x00F6DEEC`) or `uChain` (`0x010B789C`) plus
-`delta = moduleBase − 0x400000`. Each candidate is validated:
+- **narrow** (fast path, class-object scan): `MEM_PRIVATE`, `<= 64 MB`, `base >= 32 MB`;
+- **wide** (structural `rChain` scan): every readable region that is not the game image,
+  including `MEM_MAPPED` data and large private pools.
+
+The wide pass exists because the packed build keeps its level data in regions the narrow
+filter skipped (a 64 MB cap or `MEM_PRIVATE`-only filter made the structural scan report
+`magic=0` while the game was running). The log reports what was covered:
+`scan: N MB in K regions (rpe fails …, image skipped … MB), magic=… versioned=… rejected=…`
+plus a one-shot `mem: private/mapped/image …` summary.
+
+The engine builds the `uChain` / `uChainEx` class objects at runtime, so their addresses are
+a property of the **build**, not of the executable on disk. The tool keeps one pair per known
+build (`g_chainVtProfiles`):
+
+| build | `uChain` | `uChainEx` | how it was established |
+|---|---|---|---|
+| 1.10 (2018, 15 046 608 B) | `0x010B789C` | `0x00F6DEEC` | carried over from v2 (the retail runtime image) |
+| 1.20 (2017, 14 306 816 B) | `0x010B0E48` | `0x00F6DC54` | disassembled `uChain` ctor at `0x222A30` (the 1.10 ctor is at `0x211CD0`) |
+| retail Enigma-packed (8 195 416 B) | `0x00F6D534` | — | read from a chain found by the structural route on that build |
+
+When the structural route selects a chain, its class-object value is remembered
+(`g_learnedVt`), so the fast path works for that build on every later scan (level change)
+without a table entry.
+
+A candidate is a heap dword equal to either value of any profile. It is validated:
 
 ```
 uChain + 0x140 -> resource with magic "CHN\0" at +0x60 and version 0x80618 at +0x64
 ```
 
+Because the class-object addresses are build data, a profile is only a shortcut: when none of
+them exists in the process (the read returns 0 and the scanner logs `not this build`), the
+thread falls back to the **structural route** — find the `CHN\0` / `0x80618` header in the
+heap, then every heap pointer to it, and treat `pointer − 0x140` as the `uChain` base. That
+path needs no build-specific address and also covers the packed/protected executable, whose
+code is decrypted before the game reaches the level.
+
 Candidates are scored by distance from the camera to the strand centroid (the player chain
 is the closest one); the choice is re-evaluated every 120 frames. The scan thread exits once
 a chain is selected and is restarted after the level unloads (detected by 120 consecutive
-frames where the chain fails its liveness check).
+frames where the chain fails its liveness check). Liveness is checked by the `rChain` magic,
+not by the class-object address, so a build without a matching profile is not mistaken for an
+unloaded level.
 
 Joint count is *not* taken from `ChainInfo` (modded `.chn` files often declare an empty
 second chain and leave `0xCD` filler bytes). Instead the first `JointWork` block is walked

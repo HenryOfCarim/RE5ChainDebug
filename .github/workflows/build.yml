@@ -3,8 +3,12 @@ name: build
 on:
   push:
     branches: [ main, master ]
+    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write          # required by the release step on a tag
 
 jobs:
   mingw:
@@ -21,10 +25,22 @@ jobs:
         run: |
           make CXX=i686-w64-mingw32-g++ CXXFLAGS="-m32 -shared -O2 -Wall -static-libgcc -static-libstdc++"
 
-      - name: Show artefact
-        run: ls -l re5_chaindbg.asi
+      - name: Show artefact and checksum
+        run: |
+          ls -l re5_chaindbg.asi
+          sha256sum re5_chaindbg.asi > re5_chaindbg.asi.sha256
+          cat re5_chaindbg.asi.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: re5_chaindbg-asi
           path: re5_chaindbg.asi
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            re5_chaindbg.asi
+            re5_chaindbg.asi.sha256
+          generate_release_notes: true

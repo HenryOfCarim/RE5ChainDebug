@@ -1,6 +1,12 @@
 // re5_chaindbg — in-game debug draw for RE5 chain (cloth/hair) simulation and
 // its CCL collision primitives.
 //
+// v2.1: multi-build.  The uChain / uChainEx class objects are created by the
+// engine at runtime, so their addresses belong to a build.  A small profile table
+// covers the known builds and is used as a fast path; when no profile matches the
+// running process (1.20, the packed/protected exe, any other 1.0.0.129 build) the
+// scanner goes straight to the structural route and needs no address at all.
+//
 // v2: the retail Steam exe is Enigma-packed (8.2 MB on disk, imports and
 // vtables are built at runtime), so no fixed address from an unpacked build can
 // be used.  Everything is now discovered at runtime:
@@ -45,8 +51,28 @@ typedef struct { float x, y, z, rhw; DWORD color; } VERT;
 #define RCCOL_MAGIC    0x004C4343u   // 'CCL\0'
 #define RES_VERSION    0x00080618u
 
-#define CHAIN_VTABLE_PC  0x010B789Cu   // uChain
-#define CHAIN_VTABLE_EX  0x000F6DEECu   // uChainEx
+// The uChain / uChainEx class objects are created by the engine at runtime, so
+// their addresses are a property of the build.  Every known build contributes a
+// pair here; the scanner accepts any of them.  A pair that does not exist in the
+// current process simply yields no candidates (the read returns 0), and the
+// structural route below takes over, so an unknown build still works.
+typedef struct {
+    uint32_t    chain;      // uChain   class object
+    uint32_t    chainEx;    // uChainEx class object
+    const char* name;
+} ChainVtProfile;
+
+static const ChainVtProfile g_chainVtProfiles[] = {
+    { 0x010B789Cu, 0x000F6DEECu, "1.10 / retail (15 046 608 B base)" },
+    { 0x010B0E48u, 0x00F6DC54u, "1.20 (14 306 816 B base, 2017)" },
+    { 0x00F6D534u, 0x00000000u, "retail Enigma-packed (8 195 416 B)" },
+};
+#define NCHAINVT ((int)(sizeof(g_chainVtProfiles) / sizeof(g_chainVtProfiles[0])))
+
+// Set from a successful structural hit: the next scan (after a level change) can
+// use the fast path even for a build that is not in the table above.
+static uint32_t g_learnedVt = 0;
+
 #define RCHAIN_MPINFO  0x070
 #define RCCOL_MPINFO   0x070
 #define COLINFO_SIZE   0x40
@@ -107,6 +133,7 @@ static int g_viewMode = 0;     // 0: rows, 1: columns (transposed)
 static int g_wSign = 1;        // +1: w = +z, -1: w = -z
 static int g_calibScore = -1;  // joints that landed on screen with the choice
 static float g_calibSpread = 0.0f;
+
 
 static uint8_t* g_chain = NULL;
 static uint8_t* g_cands[8];
@@ -275,20 +302,68 @@ static int Readable(const void* p, size_t n)
 static uint32_t Rd32(const void* p) { uint32_t v = 0; memcpy(&v, p, 4); return v; }
 static float    Rdf(const void* p) { float v = 0; memcpy(&v, p, 4); return v; }
 
+// Does this dword look like one of the known uChain/uChainEx class objects?
+// Returns 1-based profile index, 0 when unknown.
+static int ChainVtProfileIndex(uint32_t v)
+{
+    if (!v) return 0;                       // 0 must never match an empty slot
+    if (g_learnedVt && v == g_learnedVt + (uint32_t)g_imgDelta) return NCHAINVT + 1;
+    for (int i = 0; i < NCHAINVT; ++i) {
+        uint32_t a = g_chainVtProfiles[i].chain;
+        uint32_t b = g_chainVtProfiles[i].chainEx;
+        if (a && v == a + (uint32_t)g_imgDelta) return i + 1;
+        if (b && v == b + (uint32_t)g_imgDelta) return i + 1;
+    }
+    return 0;
+}
+
 // Memory is read through ReadProcessMemory on this very process: a page that
 // disappears mid-scan (the engine frees and reallocates a lot during boot) then
 // fails gracefully instead of faulting the game.
 #define SCAN_CHUNK 0x10000
 
+// What the last scan actually covered (written by the scan thread only).
+static unsigned long long g_scanBytes = 0;
+static long g_scanRegions = 0;
+static long g_scanRpeFail = 0;
+static long g_scanSkippedImage = 0;
+
+// One-shot map of the process, so a log from an unknown build shows where its
+// memory is (the packed build keeps everything in a few huge regions).
+static void LogMemorySummary(void)
+{
+    struct { unsigned long long bytes; long count; uintptr_t maxBase; size_t maxSize; } st[3];
+    ZeroMemory(st, sizeof(st));
+    MEMORY_BASIC_INFORMATION mbi;
+    for (ULONG_PTR a = 0x10000; VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi));
+         a = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) {
+        if (!mbi.RegionSize) break;
+        if (mbi.State != MEM_COMMIT) continue;
+        int t = (mbi.Type == MEM_IMAGE) ? 2 : (mbi.Type == MEM_MAPPED ? 1 : 0);
+        st[t].bytes += mbi.RegionSize;
+        ++st[t].count;
+        if (mbi.RegionSize > st[t].maxSize) {
+            st[t].maxSize = mbi.RegionSize;
+            st[t].maxBase = (uintptr_t)mbi.BaseAddress;
+        }
+    }
+    static const char* names[3] = { "private", "mapped", "image" };
+    for (int i = 0; i < 3; ++i)
+        Log("mem: %-7s %3ld regions, %6llu MB, largest %08X + %llu MB", names[i],
+            st[i].count, st[i].bytes >> 20, (unsigned)st[i].maxBase,
+            (unsigned long long)(st[i].maxSize >> 20));
+}
+
 typedef int (*RegionCb)(uint8_t* buf, size_t len, uintptr_t addr, void* ctx);
 
-static int ScanRegions(RegionCb cb, void* ctx)
+static int ScanRegions(RegionCb cb, void* ctx, int wide)
 {
     static uint8_t buf[SCAN_CHUNK];
     ULONG_PTR addr = 0x10000;
     MEMORY_BASIC_INFORMATION mbi;
     HANDLE self = GetCurrentProcess();
     int done = 0;
+    g_scanBytes = 0; g_scanRegions = 0; g_scanRpeFail = 0; g_scanSkippedImage = 0;
     while (addr < 0x7FFF0000) {
         if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
         ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
@@ -297,14 +372,28 @@ static int ScanRegions(RegionCb cb, void* ctx)
         int readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
                         prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
                         prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
-        if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) && readable &&
-            size <= 0x04000000 && base >= 0x02000000 && mbi.Type == MEM_PRIVATE) {
-            // (the module image is below 0x02000000 and holds no heap objects)
-            for (ULONG_PTR off = 0; off < size; off += SCAN_CHUNK) {
-                SIZE_T want = (SIZE_T)((size - off) < SCAN_CHUNK ? (size - off) : SCAN_CHUNK);
-                SIZE_T got = 0;
-                if (ReadProcessMemory(self, (LPCVOID)(base + off), buf, want, &got) && got >= 4) {
-                    if (cb(buf, (size_t)got, (uintptr_t)(base + off), ctx)) { done = 1; break; }
+        // Only the game image is excluded: it holds code and constants, never the
+        // loaded rChain resources or uChain instances.  The wide pass searches all
+        // remaining readable memory, including MEM_MAPPED data and large private
+        // pools; the narrow one keeps the frequent fast-path scan cheap.
+        int isImage = (mbi.Type == MEM_IMAGE) ||
+                      (base < g_gameEnd && base + size > g_gameBase);
+        int inRange = wide ? 1 : (mbi.Type == MEM_PRIVATE && base >= 0x02000000 &&
+                                  size <= 0x04000000);
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) && readable && size) {
+            if (isImage) {
+                g_scanSkippedImage += (long)size;
+            } else if (inRange) {
+                ++g_scanRegions;
+                for (ULONG_PTR off = 0; off < size; off += SCAN_CHUNK) {
+                    SIZE_T want = (SIZE_T)((size - off) < SCAN_CHUNK ? (size - off) : SCAN_CHUNK);
+                    SIZE_T got = 0;
+                    if (ReadProcessMemory(self, (LPCVOID)(base + off), buf, want, &got) && got >= 4) {
+                        g_scanBytes += got;
+                        if (cb(buf, (size_t)got, (uintptr_t)(base + off), ctx)) { done = 1; break; }
+                    } else {
+                        ++g_scanRpeFail;
+                    }
                 }
             }
             if (done) break;
@@ -327,6 +416,7 @@ typedef struct {
     int n;
     long magicHits;
     long versionHits;
+    long badVer;
     unsigned long long bytes;
 } FindCtx;
 
@@ -343,7 +433,17 @@ static int CbFindResource(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
         else continue;
         c->magicHits++;
         uint32_t ver = Rd32(buf + i + 4);
-        if ((ver & 0xFFFF0000u) != 0x00080000u) continue;
+        if ((ver & 0xFFFF0000u) != 0x00080000u) {
+            // A magic with a version from another engine branch: say so instead of
+            // silently ignoring it, otherwise an unsupported resource looks like a
+            // scan that found nothing at all.
+            if (c->badVer < 8)
+                Log("magic %c%c%c%c at %p rejected: version %08X", (char)(v & 0xFF),
+                    (char)((v >> 8) & 0xFF), (char)((v >> 16) & 0xFF), (char)(v >> 24),
+                    (void*)(addr + i), ver);
+            ++c->badVer;
+            continue;
+        }
         c->versionHits++;
         uint32_t dataSize = Rd32(buf + i + 8);
         if (dataSize == 0 || dataSize > 0x100000) continue;
@@ -365,19 +465,22 @@ static int CbFindResource(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
 }
 
 typedef struct {
-    uint8_t* res;
+    uint8_t* res[MAXRES];    // every loaded rChain resource, so one pass is enough
+    int      nres;
     uint8_t* cand[MAXCAND];
-    int n;
+    int      n;
 } PtrCtx;
 
 static int CbFindPointer(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
 {
     PtrCtx* c = (PtrCtx*)ctx;
-    uint32_t want = (uint32_t)(uintptr_t)c->res;
     for (size_t i = 0; i + 4 < len; i += 4) {
         uint32_t v;
         memcpy(&v, buf + i, 4);
-        if (v != want) continue;
+        int hit = 0;
+        for (int r = 0; r < c->nres; ++r)
+            if (v == (uint32_t)(uintptr_t)c->res[r]) { hit = 1; break; }
+        if (!hit) continue;
         uint8_t* chain = (uint8_t*)(addr + i) - OFF_MPCHAIN;
         if (!Readable(chain, 0x260)) continue;
         uint32_t vt = SRd32((uint32_t)(uintptr_t)chain);
@@ -391,11 +494,12 @@ static int InitJoints(uint8_t* c)
 {
     uint8_t* base = (uint8_t*)SRd32((uint32_t)(uintptr_t)c + g_offJW);
     if (!base) return 0;
-    int n = g_chainJoints < 16 ? g_chainJoints : 16;
-    if (!Readable(base, n * 4)) n = 4;
-    if (!Readable(base, n * 4)) return 0;
+    // Do not limit the walk to g_chainJoints: it is still 0 while the first
+    // candidate is being scored, which made every candidate count 0 joints and the
+    // structural route reject the real chain with score 0.
     int cnt = 0;
-    for (int k = 0; k < n; ++k) {
+    for (int k = 0; k < 16; ++k) {
+        if (!Readable(base + 4 * k, 4)) break;
         uint32_t v = Rd32(base + 4 * k);
         if (!v) continue;
         uint8_t* j = (uint8_t*)(uintptr_t)v;
@@ -409,12 +513,14 @@ static int InitJoints(uint8_t* c)
     return cnt;
 }
 
-static int ScoreChain(uint8_t* c)
+// The col-joint world matrices are documented as null on PC (mpColJointWMat), so
+// they only add a tie-breaker; the joints are what makes a candidate real.
+static int ScoreChain(uint8_t* c, int* jointsOut)
 {
+    int joints = InitJoints(c);
     uint32_t jmat = SRd32((uint32_t)(uintptr_t)c + g_offCJ);
-    int score = (jmat && Readable((void*)(uintptr_t)jmat, 64)) ? 100 : 0;
-    score += InitJoints(c) * 2;
-    return score;
+    if (jointsOut) *jointsOut = joints;
+    return joints * 2 + ((jmat && Readable((void*)(uintptr_t)jmat, 64)) ? 1 : 0);
 }
 
 // The console symbol dump and the PC build agree on most of uChain, but not
@@ -569,8 +675,10 @@ static void ChainCounts(void)
         g_chainJoints, g_chainJoints, blockJoints, g_chainPrims);
 }
 
-// Preferred route on the 1.10 PC build: the uChain vtable address is fixed, so
-// every live instance can be enumerated directly and scored.
+// Fast route: every live uChain instance carries one of the known class-object
+// pointers, so they can be enumerated directly and scored.  The values are build
+// data (see g_chainVtProfiles); a build that is not in the table simply produces
+// no candidates and the structural rChain route below takes over.
 typedef struct { uint8_t* cand[16]; int n; } VtCtx;
 
 static int CbFindVtable(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
@@ -579,7 +687,7 @@ static int CbFindVtable(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
     for (size_t i = 0; i + 4 < len; i += 4) {
         uint32_t v;
         memcpy(&v, buf + i, 4);
-        if (v != (CHAIN_VTABLE_PC + g_imgDelta) && v != (CHAIN_VTABLE_EX + g_imgDelta)) continue;
+        if (!ChainVtProfileIndex(v)) continue;
         uint8_t* chain = (uint8_t*)(addr + i);
         if (!Readable(chain, 0x260)) continue;
         if (c->n < 16) c->cand[c->n++] = chain;
@@ -708,7 +816,7 @@ static void FindSCamera(void)
 {
     ScCtx c;
     ZeroMemory(&c, sizeof(c));
-    ScanRegions(CbFindSCamera, &c);
+    ScanRegions(CbFindSCamera, &c, 0);
     if (c.n == 0) {
         Log("sCamera: not found (%d candidates)", c.n);
         g_scOk = 0;
@@ -840,7 +948,7 @@ static int TryVtableRoute(void)
 {
     VtCtx vc;
     ZeroMemory(&vc, sizeof(vc));
-    ScanRegions(CbFindVtable, &vc);
+    ScanRegions(CbFindVtable, &vc, 1);
     if (vc.n == 0) { Log("vtable route: no uChain objects"); return 0; }
     Log("vtable route: %d candidate object(s)", vc.n);
 
@@ -878,6 +986,14 @@ static int TryVtableRoute(void)
     }
     if (g_candN == 0) return 0;
     g_chain = g_cands[0];
+    {
+        uint32_t vt = SRd32((uint32_t)(uintptr_t)g_chain);
+        int pi = ChainVtProfileIndex(vt);
+        if (pi > 0 && pi <= NCHAINVT)
+            Log("build: %s, uChain vt=%08X", g_chainVtProfiles[pi - 1].name, vt);
+        else if (pi > NCHAINVT)
+            Log("build: learned class object, uChain vt=%08X", vt);
+    }
     ChainCounts();
     FindModelJoints();      // background thread
     g_wantScan = 0;
@@ -887,45 +1003,138 @@ static int TryVtableRoute(void)
 }
 
 static void FindModelJoints(void);
+static void HexDump(const char* tag, const uint8_t* q, int len);
+static void DumpChainOnce(void);
+
+// Collected structural candidates also feed the nearest-to-camera re-evaluation,
+// so the player's chain wins even when another unit's chain was found first.
+static void AddCandidate(uint8_t* c)
+{
+    if (!c || g_candN >= 8) return;
+    for (int i = 0; i < g_candN; ++i) if (g_cands[i] == c) return;
+    g_cands[g_candN++] = c;
+}
+
+// A profile value is usable only when the class object it points at exists here:
+// its first slot is a virtual function, i.e. code inside the game image.
+static int VtUsable(uint32_t ref)
+{
+    uint32_t a = ref + (uint32_t)g_imgDelta;
+    uint32_t fn = SRd32(a);
+    return fn >= (uint32_t)g_gameBase && fn < (uint32_t)g_gameEnd;
+}
+
+static int AnyKnownVtUsable(void)
+{
+    if (g_learnedVt && VtUsable(g_learnedVt)) return 1;
+    for (int i = 0; i < NCHAINVT; ++i) {
+        if (g_chainVtProfiles[i].chain && VtUsable(g_chainVtProfiles[i].chain)) return 1;
+        if (g_chainVtProfiles[i].chainEx && VtUsable(g_chainVtProfiles[i].chainEx)) return 1;
+    }
+    return 0;
+}
+
+// The rChain resources stay put while the level is loaded, so the expensive magic
+// pass runs once; retries only repeat the pointer pass against the cache.
+static uint8_t* g_resCache[MAXRES];
+static int g_resN = 0;
 
 static DWORD WINAPI ScanThread(LPVOID)
 {
     InterlockedExchange(&g_scanRunning, 1);
     Log("scan thread started");
-    Sleep(3000);
-    int attempt = 0;
+    LogMemorySummary();
+    Log("image %08X-%08X (%.1f MB)", (unsigned)g_gameBase, (unsigned)g_gameEnd,
+        (double)(g_gameEnd - g_gameBase) / (1024.0 * 1024.0));
+    for (int i = 0; i < NCHAINVT; ++i) {
+        uint32_t a = g_chainVtProfiles[i].chain + (uint32_t)g_imgDelta;
+        uint32_t fn = g_chainVtProfiles[i].chain ? SRd32(a) : 0;
+        Log("  vt profile %d (%s): uChain=%08X -> [%08X] %s", i + 1,
+            g_chainVtProfiles[i].name, a, fn,
+            (g_chainVtProfiles[i].chain && VtUsable(g_chainVtProfiles[i].chain))
+                ? "usable" : "not this build");
+    }
+    if (g_learnedVt)
+        Log("  learned class object %08X -> [%08X] %s", g_learnedVt,
+            SRd32(g_learnedVt + (uint32_t)g_imgDelta),
+            VtUsable(g_learnedVt) ? "usable" : "gone");
+    if (!AnyKnownVtUsable())
+        Log("no known uChain profile matches - using the structural rChain route only");
+    Sleep(2000);
     while (g_wantScan) {
+        // Fast path: one pass over memory for the known class objects.
         if (TryVtableRoute()) break;
-        // the resource route costs several extra full-memory passes, so it is
-        // only tried every third time; the vtable route is the primary one
-        if ((attempt++ % 3) != 0) { Sleep(10000); continue; }
-        FindCtx fc;
-        ZeroMemory(&fc, sizeof(fc));
-        ScanRegions(CbFindResource, &fc);
-        Log("scan: %llu MB, magic=%ld versioned=%ld chn resources=%d",
-            fc.bytes / (1024ull * 1024ull), fc.magicHits, fc.versionHits, fc.n);
-        if (fc.n == 0) { Sleep(10000); continue; }
+
+        // Structural path: find the rChain resources once, then every pointer to them.
+        if (g_resN == 0) {
+            FindCtx fc;
+            ZeroMemory(&fc, sizeof(fc));
+            ScanRegions(CbFindResource, &fc, 1);
+            Log("scan: %llu MB in %ld regions (rpe fails %ld, image skipped %ld MB), "
+                "magic=%ld versioned=%ld rejected=%ld chn resources=%d",
+                g_scanBytes >> 20, g_scanRegions, g_scanRpeFail, g_scanSkippedImage >> 20,
+                fc.magicHits, fc.versionHits, fc.badVer, fc.n);
+            for (int i = 0; i < fc.n; ++i) g_resCache[i] = fc.res[i];
+            g_resN = fc.n;
+        } else {
+            Log("scan: reusing %d cached rChain resource(s)", g_resN);
+        }
+        if (g_resN == 0) { Sleep(5000); continue; }
+
+        PtrCtx pc;
+        ZeroMemory(&pc, sizeof(pc));
+        pc.nres = g_resN;
+        for (int i = 0; i < g_resN; ++i) pc.res[i] = g_resCache[i];
+        ScanRegions(CbFindPointer, &pc, 1);
+        if (pc.n == 0) {
+            Log("scan: no uChain points to the cached resources, dropping them");
+            g_resN = 0;
+            Sleep(5000);
+            continue;
+        }
 
         uint8_t* best = NULL;
         int bestScore = -1;
-        for (int r = 0; r < fc.n; ++r) {
-            PtrCtx pc;
-            ZeroMemory(&pc, sizeof(pc));
-            pc.res = fc.res[r];
-            ScanRegions(CbFindPointer, &pc);
-            for (int k = 0; k < pc.n; ++k) {
-                int sc = ScoreChain(pc.cand[k]);
-                uint8_t* cch = pc.cand[k];
-                Log("  cand res#%d chain=%p vt=%08X jw=%08X jmat=%08X score=%d",
-                    r, (void*)cch, SRd32((uint32_t)(uintptr_t)cch), SRd32((uint32_t)(uintptr_t)cch + g_offJW),
-                    SRd32((uint32_t)(uintptr_t)cch + g_offCJ), sc);
-                if (sc > bestScore) { bestScore = sc; best = pc.cand[k]; }
-            }
+        for (int k = 0; k < pc.n; ++k) {
+            uint8_t* cch = pc.cand[k];
+            int jcnt = 0;
+            int sc = ScoreChain(cch, &jcnt);
+            Log("  cand chain=%p vt=%08X jw=%08X jmat=%08X joints=%d score=%d",
+                (void*)cch, SRd32((uint32_t)(uintptr_t)cch),
+                SRd32((uint32_t)(uintptr_t)cch + g_offJW),
+                SRd32((uint32_t)(uintptr_t)cch + g_offCJ), jcnt, sc);
+            if (sc > bestScore) { bestScore = sc; best = cch; }
+            if (sc >= 2) AddCandidate(cch);
         }
-        if (!best || bestScore <= 0) { Sleep(10000); continue; }
+        if (!best) { Sleep(5000); continue; }
+        if (bestScore < 2) {
+            // The object may be a real chain whose arrays hang at other offsets in
+            // this build: let the structural layout probe find them and rescore.
+            Log("layout: rescoring %p with auto-detected offsets", (void*)best);
+            AutoLayout(best);
+            int jcnt = 0;
+            bestScore = ScoreChain(best, &jcnt);
+            Log("  rescan joints=%d score=%d", jcnt, bestScore);
+        }
+        if (bestScore < 2) {
+            static int dumped = 0;
+            if (!dumped) { dumped = 1; HexDump("rej", best, 0x120); }
+            Log("reject candidate %p: no joints (vt=%08X)", (void*)best,
+                SRd32((uint32_t)(uintptr_t)best));
+            Sleep(5000);
+            continue;
+        }
 
         g_chain = best;
         ChainCounts();
+        DumpChainOnce();
+        {
+            uint32_t vt = SRd32((uint32_t)(uintptr_t)best);
+            if (vt && !ChainVtProfileIndex(vt)) {
+                g_learnedVt = vt;
+                Log("learned uChain class object %08X (fast path for the next scan)", vt);
+            }
+        }
         FindModelJoints();          // background thread: never stalls a frame
         g_wantScan = 0;
         Log("uChain chosen %p score=%d joints=%d prims=%d", (void*)g_chain, bestScore,
@@ -1467,6 +1676,7 @@ static void ResetChainState(void)
     g_candN = 0;
     g_jarr = NULL;
     g_jstride = 0;
+    g_resN = 0;                // the resources belong to the level that went away
     g_forceCache = 1;
     g_wantScan = 1;
 }
@@ -1475,8 +1685,13 @@ static int ChainStillAlive(void)
 {
     if (!g_chain) return 0;
     if (!Readable(g_chain, 0x260)) return 0;
+    // The class-object address is build-specific (it is created by the engine at
+    // runtime), so the rChain magic below is the real identity check; only require
+    // a plausible class pointer here.  Without this, any build whose addresses do
+    // not match the profile would be declared dead every 120 frames and the
+    // overlay would never draw.
     uint32_t vt = SRd32((uint32_t)(uintptr_t)g_chain);
-    if (vt != (CHAIN_VTABLE_PC + g_imgDelta) && vt != (CHAIN_VTABLE_EX + g_imgDelta)) return 0;
+    if (vt < 0x00400000u || vt > 0x04000000u) return 0;
     uint32_t res = SRd32((uint32_t)(uintptr_t)g_chain + OFF_MPCHAIN);
     if (!res || !Readable((void*)(uintptr_t)res, 0x78)) return 0;
     if (SRd32((uint32_t)(uintptr_t)res + 0x60) != RCHAIN_MAGIC) return 0;
@@ -2234,7 +2449,7 @@ BOOL APIENTRY DllMain(HMODULE hmod, DWORD reason, LPVOID)
         g_logCsInit = 1;
         DisableThreadLibraryCalls(hmod);
         g_log = OpenLog();
-        Log("re5_chaindbg v2 loaded");
+        Log("re5_chaindbg v2.2 loaded");
         CreateThread(NULL, 0, Install, NULL, 0, NULL);
     }
     return TRUE;
