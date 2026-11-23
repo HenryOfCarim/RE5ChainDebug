@@ -22,6 +22,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <io.h>
 #include "rest_links.h"
 #include <stdio.h>
 #include <stdint.h>
@@ -58,6 +59,8 @@ typedef IDirect3D9* (__stdcall* PFN_D3DCreate9)(UINT);
 
 static PFN_EndScene    g_origEndScene = NULL;
 static PFN_Present     g_origPresent = NULL;
+typedef HRESULT(__stdcall* PFN_DrawIndexedPrimitive)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+static PFN_DrawIndexedPrimitive g_origDrawIP = NULL;
 typedef HRESULT(__stdcall* PFN_Reset)(IDirect3DDevice9*, void*);
 static PFN_Reset       g_origReset = NULL;
 static PFN_SetVSConstF g_origSetVSConstF = NULL;
@@ -81,6 +84,20 @@ static volatile LONG g_scanRunning = 0;
 #define NBLOCKS 24
 static float g_blocks[NBLOCKS][4];
 static volatile LONG g_camOk = 0;
+// Matrices snapshotted inside DrawIndexedPrimitive: at that moment the shader
+// constants that were uploaded last are exactly the ones this draw uses, so the
+// main pass can be identified instead of guessing from the end of the frame.
+static float g_use[NBLOCKS][4];
+static volatile LONG g_useValid = 0;
+static volatile int  g_captureEnabled = 0;   // F9: draw-time capture (hook not installed)
+static volatile LONG g_frameCaptured = 0;
+static float g_lastCam[3] = { 0, 0, 0 };
+static volatile LONG g_lastCamValid = 0;
+static float g_useCamDist = 1e9f;
+static float g_frameBest[NBLOCKS][4];
+static float g_frameBestCam[3];
+static float g_frameBestScore = 1e9f;
+static volatile LONG g_frameHave = 0;
 static float g_view[12];      // validated view rows (xyz + translation in .w)
 static volatile LONG g_viewOk = 0;
 static volatile LONG g_viewHits = 0;
@@ -98,6 +115,102 @@ static int g_candN = 0;
 static int g_chainJoints = 0;
 static int g_chainPrims = 0;
 
+
+// ---------------------------------------------------------------- crash probe
+// Logs the faulting address of a fatal exception so a crash can be attributed to
+// our module, the game or something else, without an external debugger.
+static HMODULE g_selfModule = NULL;
+static uintptr_t g_selfBase = 0, g_selfEnd = 0;
+static uintptr_t g_gameBase = 0, g_gameEnd = 0;
+
+static void LogRaw(const char* text)
+{
+    if (!g_log) return;
+    fputs(text, g_log);
+    fflush(g_log);
+}
+
+static LONG CALLBACK CrashProbe(PEXCEPTION_POINTERS info)
+{
+    DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_INT_DIVIDE_BY_ZERO)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    uintptr_t addr = (uintptr_t)info->ExceptionRecord->ExceptionAddress;
+
+    // first-chance: our module raised an AV but the game may swallow it.  Those
+    // are the early warning of heap/stack damage, so record them once per site.
+    static uintptr_t seen[16];
+    static int seenN = 0;
+    if (addr >= g_selfBase && addr < g_selfEnd) {
+        int known = 0;
+        for (int i = 0; i < seenN; ++i) if (seen[i] == addr) known = 1;
+        if (!known) {
+            if (seenN < 16) seen[seenN++] = addr;
+            char first[160];
+            ULONG_PTR fa = 0;
+            if (info->ExceptionRecord->NumberParameters > 1)
+                fa = info->ExceptionRecord->ExceptionInformation[1];
+            _snprintf(first, sizeof(first), "FIRSTCHANCE code=%08lX addr=asi+0x%X arg=%p\n",
+                      code, (unsigned)(addr - g_selfBase), (void*)fa);
+            LogRaw(first);
+        }
+    }
+    char line[220];
+    const char* where = "other";
+    uintptr_t off = addr;
+    if (addr >= g_selfBase && addr < g_selfEnd) { where = "re5_chaindbg.asi"; off = addr - g_selfBase; }
+    else if (addr >= g_gameBase && addr < g_gameEnd) { where = "re5dx9.exe"; off = addr - g_gameBase; }
+
+    ULONG_PTR arg0 = 0;
+    if (info->ExceptionRecord->NumberParameters > 1)
+        arg0 = info->ExceptionRecord->ExceptionInformation[1];
+
+    _snprintf(line, sizeof(line), "CRASH code=%08lX addr=%p (%s+0x%X) arg=%p\n",
+              code, (void*)addr, where, (unsigned)off, (void*)arg0);
+    LogRaw(line);
+
+    // walk the frame chain and report every return address with its module, so a
+    // crash can be attributed to a function instead of a single offset
+    CONTEXT* ctx = info->ContextRecord;
+    uint32_t ebp = (uint32_t)ctx->Ebp;
+    for (int depth = 0; depth < 24 && ebp > 0x10000 && ebp < 0x7FFF0000; ++depth) {
+        uint32_t frame[2] = { 0, 0 };
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)ebp, frame, sizeof(frame), &got) ||
+            got != sizeof(frame)) break;
+        uint32_t ret = frame[1];
+        if (!ret) break;
+        const char* m = "other";
+        uint32_t o = ret;
+        if (ret >= g_selfBase && ret < g_selfEnd) { m = "asi"; o = ret - g_selfBase; }
+        else if (ret >= g_gameBase && ret < g_gameEnd) { m = "game"; o = ret - g_gameBase; }
+        _snprintf(line, sizeof(line), "  frame %02d ret=%p (%s+0x%X)\n", depth, (void*)ret, m, o);
+        LogRaw(line);
+        if (frame[0] <= ebp) break;
+        ebp = frame[0];
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InitCrashProbe(HMODULE self)
+{
+    g_selfModule = self;
+    g_selfBase = (uintptr_t)self;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)self;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_selfBase + dos->e_lfanew);
+    g_selfEnd = g_selfBase + nt->OptionalHeader.SizeOfImage;
+
+    HMODULE game = GetModuleHandleA(NULL);
+    g_gameBase = (uintptr_t)game;
+    dos = (IMAGE_DOS_HEADER*)game;
+    nt = (IMAGE_NT_HEADERS*)(g_gameBase + dos->e_lfanew);
+    g_gameEnd = g_gameBase + nt->OptionalHeader.SizeOfImage;
+
+    AddVectoredExceptionHandler(1, CrashProbe);
+}
+
 // ------------------------------------------------------------------ logging
 static CRITICAL_SECTION g_logCs;
 static volatile LONG g_logCsInit = 0;
@@ -105,12 +218,7 @@ static volatile LONG g_logCsInit = 0;
 static void Log(const char* fmt, ...)
 {
     if (!g_log) return;
-    if (!g_logCsInit) {
-        if (InterlockedCompareExchange(&g_logCsInit, 1, 0) == 0)
-            InitializeCriticalSection(&g_logCs);
-        else
-            while (!g_logCsInit) Sleep(1);
-    }
+    if (!g_logCsInit) return;                        // initialised in DllMain
     if (!TryEnterCriticalSection(&g_logCs)) return;   // never stall a frame
     va_list ap; va_start(ap, fmt);
     vfprintf(g_log, fmt, ap);
@@ -272,7 +380,7 @@ static int CbFindPointer(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
         if (v != want) continue;
         uint8_t* chain = (uint8_t*)(addr + i) - OFF_MPCHAIN;
         if (!Readable(chain, 0x260)) continue;
-        uint32_t vt = Rd32(chain);
+        uint32_t vt = SRd32((uint32_t)(uintptr_t)chain);
         if (vt < 0x00400000u || vt > 0x04000000u) continue;
         if (c->n < MAXCAND) c->cand[c->n++] = chain;
     }
@@ -281,7 +389,7 @@ static int CbFindPointer(uint8_t* buf, size_t len, uintptr_t addr, void* ctx)
 
 static int InitJoints(uint8_t* c)
 {
-    uint8_t* base = (uint8_t*)Rd32(c + g_offJW);
+    uint8_t* base = (uint8_t*)SRd32((uint32_t)(uintptr_t)c + g_offJW);
     if (!base) return 0;
     int n = g_chainJoints < 16 ? g_chainJoints : 16;
     if (!Readable(base, n * 4)) n = 4;
@@ -303,7 +411,7 @@ static int InitJoints(uint8_t* c)
 
 static int ScoreChain(uint8_t* c)
 {
-    uint32_t jmat = Rd32(c + g_offCJ);
+    uint32_t jmat = SRd32((uint32_t)(uintptr_t)c + g_offCJ);
     int score = (jmat && Readable((void*)(uintptr_t)jmat, 64)) ? 100 : 0;
     score += InitJoints(c) * 2;
     return score;
@@ -336,7 +444,7 @@ static void FindColMatrices(void)
     if (g_offCJfound || !g_chain) return;
     int bestOff = -1, bestCnt = 0;
     for (int off = 0; off <= 0x2FC; off += 4) {
-        uint32_t v = Rd32(g_chain + off);
+        uint32_t v = SRd32((uint32_t)(uintptr_t)g_chain + off);
         if (!v || !Readable((void*)(uintptr_t)v, 64 * 3)) continue;
         int cnt = 0;
         for (int k = 0; k < 8; ++k) {
@@ -358,7 +466,7 @@ static void FindColMatrices(void)
 static int CountJointWork(uint8_t* chain, int off)
 {
     if (!Readable(chain + off, 4)) return 0;
-    uint32_t jw = Rd32(chain + off);
+    uint32_t jw = SRd32((uint32_t)(uintptr_t)chain + off);
     if (!jw || !Readable((void*)(uintptr_t)jw, 8)) return 0;
     int n = 0;
     for (int k = 0; k < 8; ++k) {
@@ -391,7 +499,7 @@ static void AutoLayout(uint8_t* chain)
     int bestCj = g_offCJ, bestScore = 0;
     for (int off = 0x200; off <= 0x240; off += 4) {
         if (!Readable(chain + off, 4)) break;
-        uint32_t v = Rd32(chain + off);
+        uint32_t v = SRd32((uint32_t)(uintptr_t)chain + off);
         if (!v || !LooksLikeMatrix((void*)(uintptr_t)v)) continue;
         int sc = 1 + (LooksLikeMatrix((void*)(uintptr_t)(v + 64)) ? 1 : 0);
         if (sc > bestScore) { bestScore = sc; bestCj = off; }
@@ -413,7 +521,7 @@ static int DiscoverJoints(void)
     g_jblock = NULL;
     uint8_t* arr = JointBase();
     if (!arr || !Readable(arr, 4)) return 0;
-    uint32_t block = Rd32(arr);
+    uint32_t block = SRd32((uint32_t)(uintptr_t)arr);
     if (!block || !Readable((void*)(uintptr_t)block, 0x1D0)) return 0;
     g_jblock = (uint8_t*)(uintptr_t)block;
 
@@ -433,16 +541,16 @@ static void ChainCounts(void)
     g_chainJoints = 0;
     g_chainPrims = 0;
     if (!g_chain) return;
-    uint8_t* chainRes = (uint8_t*)Rd32(g_chain + OFF_MPCHAIN);
+    uint8_t* chainRes = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)g_chain + OFF_MPCHAIN);
     if (!chainRes || !Readable(chainRes, 0x78)) {
         Log("counts: mpChain unreadable (%p)", (void*)chainRes);
         return;
     }
-    uint8_t* info = (uint8_t*)Rd32(chainRes + RCHAIN_MPINFO);
+    uint8_t* info = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)chainRes + RCHAIN_MPINFO);
     uint8_t nch = *(uint8_t*)(chainRes + 0x6C);
     Log("counts: res=%p hdr=%08X %08X %08X %08X info=%p nch=%u",
-        (void*)chainRes, Rd32(chainRes + 0x60), Rd32(chainRes + 0x64),
-        Rd32(chainRes + 0x68), Rd32(chainRes + 0x6C), (void*)info, nch);
+        (void*)chainRes, SRd32((uint32_t)(uintptr_t)chainRes + 0x60), SRd32((uint32_t)(uintptr_t)chainRes + 0x64),
+        SRd32((uint32_t)(uintptr_t)chainRes + 0x68), SRd32((uint32_t)(uintptr_t)chainRes + 0x6C), (void*)info, nch);
 
     // no bail-outs: a strange chain count must not wipe the primitive count
     int chains = (nch >= 1 && nch <= 8) ? nch : 1;
@@ -455,7 +563,7 @@ static void ChainCounts(void)
     }
     int blockJoints = DiscoverJoints();
     if (blockJoints > g_chainJoints) g_chainJoints = blockJoints;
-    g_chainPrims = (int)Rd32(g_chain + OFF_COLINFONUM);
+    g_chainPrims = (int)SRd32((uint32_t)(uintptr_t)g_chain + OFF_COLINFONUM);
     if (g_chainPrims < 0 || g_chainPrims > 64) g_chainPrims = 0;
     Log("counts: joints=%d (chaininfo=%d block=%d) prims=%d",
         g_chainJoints, g_chainJoints, blockJoints, g_chainPrims);
@@ -484,11 +592,11 @@ static void CountsOf(uint8_t* c, int* joints, int* prims, uint32_t* magic)
 {
     *joints = 0; *prims = 0; *magic = 0;
     if (!c || !Readable(c, 0x260)) return;
-    uint8_t* res = (uint8_t*)Rd32(c + OFF_MPCHAIN);
+    uint8_t* res = (uint8_t*)(uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)c + OFF_MPCHAIN);
     if (!res || !Readable(res, 0x78)) return;
-    *magic = Rd32(res + 0x60);
+    *magic = SRd32((uint32_t)(uintptr_t)res + 0x60);
     if (*magic != RCHAIN_MAGIC) return;
-    uint8_t* info = (uint8_t*)Rd32(res + RCHAIN_MPINFO);
+    uint8_t* info = (uint8_t*)SRd32((uint32_t)(uintptr_t)res + RCHAIN_MPINFO);
     uint8_t nch = *(uint8_t*)(res + 0x6C);
     int chains = (nch >= 1 && nch <= 8) ? nch : 1;
     if (Readable(info, 0x20)) {
@@ -498,7 +606,7 @@ static void CountsOf(uint8_t* c, int* joints, int* prims, uint32_t* magic)
             *joints += num;
         }
     }
-    *prims = (int)Rd32(c + OFF_COLINFONUM);
+    *prims = (int)SRd32((uint32_t)(uintptr_t)c + OFF_COLINFONUM);
     if (*prims < 0 || *prims > 64) *prims = 0;
 }
 
@@ -509,6 +617,28 @@ static void CountsOf(uint8_t* c, int* joints, int* prims, uint32_t* magic)
 // those is far more reliable than guessing which shader-constant block was the
 // main pass.  Layout from re5_freecam: dword0 = exe vtable, +0x54 = uCamera*,
 // viewport 0 at +0x50, mViewMat at +0x100, mProjMat at +0x140.
+static int FilterOutliers(float (*world)[3], int n, float maxDist)
+{
+    if (n < 4) return n;
+    float cx = 0, cy = 0, cz = 0;
+    for (int i = 0; i < n; ++i) { cx += world[i][0]; cy += world[i][1]; cz += world[i][2]; }
+    cx /= n; cy /= n; cz /= n;
+
+    int out = 0;
+    for (int i = 0; i < n; ++i) {
+        float dx = world[i][0] - cx, dy = world[i][1] - cy, dz = world[i][2] - cz;
+        if (sqrtf(dx * dx + dy * dy + dz * dz) <= maxDist) {
+            if (out != i) {
+                world[out][0] = world[i][0];
+                world[out][1] = world[i][1];
+                world[out][2] = world[i][2];
+            }
+            ++out;
+        }
+    }
+    return out;
+}
+
 static void GatherJoints(float (*world)[3], int* count, int maxn);
 
 static uint8_t* g_sc = NULL;
@@ -656,9 +786,9 @@ static void CamPos(float* out)
 static int ChainCentroid(uint8_t* c, float* out)
 {
     if (!c || !Readable(c, 0x260)) return 0;
-    uint8_t* arr = (uint8_t*)Rd32(c + OFF_JOINTWORK);
+    uint8_t* arr = (uint8_t*)SRd32((uint32_t)(uintptr_t)c + OFF_JOINTWORK);
     if (!arr || !Readable(arr, 4)) return 0;
-    uint32_t block = Rd32(arr);
+    uint32_t block = SRd32((uint32_t)(uintptr_t)arr);
     if (!block) return 0;
     float sx = 0, sy = 0, sz = 0;
     int n = 0;
@@ -722,7 +852,7 @@ static int TryVtableRoute(void)
     int bestScore = -1;
     for (int i = 0; i < vc.n; ++i) {
         uint8_t* c = vc.cand[i];
-        uint8_t* res = (uint8_t*)Rd32(c + OFF_MPCHAIN);
+        uint8_t* res = (uint8_t*)(uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)c + OFF_MPCHAIN);
         int joints = 0, prims = 0;
         uint32_t resMagic = 0;
         CountsOf(c, &joints, &prims, &resMagic);
@@ -787,8 +917,8 @@ static DWORD WINAPI ScanThread(LPVOID)
                 int sc = ScoreChain(pc.cand[k]);
                 uint8_t* cch = pc.cand[k];
                 Log("  cand res#%d chain=%p vt=%08X jw=%08X jmat=%08X score=%d",
-                    r, (void*)cch, Rd32(cch), Rd32(cch + g_offJW),
-                    Rd32(cch + g_offCJ), sc);
+                    r, (void*)cch, SRd32((uint32_t)(uintptr_t)cch), SRd32((uint32_t)(uintptr_t)cch + g_offJW),
+                    SRd32((uint32_t)(uintptr_t)cch + g_offCJ), sc);
                 if (sc > bestScore) { bestScore = sc; best = pc.cand[k]; }
             }
         }
@@ -850,6 +980,31 @@ static int ProjectWith(int reg, int mode, int sign, const float* world, int w, i
 
 static int Project(const float* world, int w, int h, float* sx, float* sy)
 {
+    if (g_useValid) {
+        g_fx = g_use[7][0] > 0.05f ? g_use[7][0] : g_fx;
+        g_fy = g_use[7][1] > 0.05f ? g_use[7][1] : g_fy;
+        const float* v0 = g_use[g_viewReg];
+        const float* v1 = g_use[g_viewReg + 1];
+        const float* v2 = g_use[g_viewReg + 2];
+        float px, py, pz;
+        if (g_viewMode == 0) {
+            px = world[0] * v0[0] + world[1] * v0[1] + world[2] * v0[2] + v0[3];
+            py = world[0] * v1[0] + world[1] * v1[1] + world[2] * v1[2] + v1[3];
+            pz = world[0] * v2[0] + world[1] * v2[1] + world[2] * v2[2] + v2[3];
+        } else {
+            px = world[0] * v0[0] + world[1] * v1[0] + world[2] * v2[0] + v0[3];
+            py = world[0] * v0[1] + world[1] * v1[1] + world[2] * v2[1] + v1[3];
+            pz = world[0] * v0[2] + world[1] * v1[2] + world[2] * v2[2] + v2[3];
+        }
+        float cw = pz * (float)g_wSign;
+        if (cw <= 0.05f) return 0;
+        float ndcX = px * g_fx / cw;
+        float ndcY = py * g_fy / cw;
+        if (!(ndcX > -1.6f && ndcX < 1.6f && ndcY > -1.6f && ndcY < 1.6f)) return 0;
+        *sx = (ndcX * 0.5f + 0.5f) * (float)w;
+        *sy = (0.5f - ndcY * 0.5f) * (float)h;
+        return 1;
+    }
     if (g_scOk) {
         const float* v0 = (const float*)(g_sc + 0x100);
         const float* v1 = (const float*)(g_sc + 0x104);
@@ -910,9 +1065,9 @@ static uint8_t* JointAt(int i)
         return Readable(j, 0x1D0) ? j : NULL;
     }
     uint8_t* arr = JointBase();
-    uint8_t* chainRes = (uint8_t*)Rd32(g_chain + OFF_MPCHAIN);
+    uint8_t* chainRes = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)g_chain + OFF_MPCHAIN);
     if (!arr || !chainRes || !Readable(chainRes, 0x78)) return NULL;
-    uint8_t* info = (uint8_t*)Rd32(chainRes + RCHAIN_MPINFO);
+    uint8_t* info = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)chainRes + RCHAIN_MPINFO);
     uint8_t nch = *(uint8_t*)(chainRes + 0x6C);
     if (!Readable(info, 0x20)) return NULL;
     if (nch == 0 || nch > 8) nch = 1;
@@ -922,7 +1077,7 @@ static uint8_t* JointAt(int i)
         int num = info[c * 0x20];
         if (idx < num) {
             if (!Readable(arr + 4 * c, 4)) return NULL;
-            uint32_t block = Rd32(arr + 4 * c);
+            uint32_t block = SRd32((uint32_t)(uintptr_t)arr + 4 * c);
             if (!block) return NULL;
             uint8_t* j = (uint8_t*)(uintptr_t)block + (size_t)idx * 0x1D0;
             return Readable(j, 0x1D0) ? j : NULL;
@@ -964,7 +1119,10 @@ static void GatherJoints(float (*world)[3], int* count, int maxn)
 {
     *count = 0;
     if (!g_chain || g_chainJoints <= 0) return;
-    if (g_forceCache || g_jcacheN == 0 || (g_frame - g_jcacheFrame) > 120) { g_forceCache = 0; RefreshJointCache(); }
+    if (g_forceCache || g_jcacheN == 0 || (g_frame - g_jcacheFrame) > 120) {
+        g_forceCache = 0;
+        RefreshJointCache();
+    }
     for (int i = 0; i < g_jcacheN && *count < maxn; ++i) {
         const float* m = (const float*)(g_jcache[i] + JW_WORLDMAT);
         float x = m[12], y = m[13], z = m[14];
@@ -973,6 +1131,7 @@ static void GatherJoints(float (*world)[3], int* count, int maxn)
         world[*count][0] = x; world[*count][1] = y; world[*count][2] = z;
         ++(*count);
     }
+    *count = FilterOutliers(world, *count, 600.0f);
 }
 
 static float VLen3(const float* v)
@@ -1024,6 +1183,38 @@ static void CamPosOf(int reg, float* out)
 static void Calibrate(int w, int h)
 {
     if (g_locked) return;
+    if (g_useValid) {
+        g_viewReg = 4;
+        g_viewMode = 0;
+        // handedness: pick the sign that keeps the cloud nearest the screen centre
+        float world[160][3];
+        int n = 0;
+        GatherJoints(world, &n, 160);
+        if (n > 0) {
+            float cx = 0, cy = 0, cz = 0;
+            for (int i = 0; i < n; ++i) { cx += world[i][0]; cy += world[i][1]; cz += world[i][2]; }
+            cx /= n; cy /= n; cz /= n;
+            float cen[3] = { cx, cy, cz };
+            float bestD = 1e30f;
+            int bestSign = -1;
+            for (int sg = 1; sg >= -1; sg -= 2) {
+                float sx, sy;
+                int save = g_wSign;
+                g_wSign = sg;
+                int ok = Project(cen, w, h, &sx, &sy);
+                g_wSign = save;
+                if (!ok) continue;
+                float dx = sx - w * 0.5f, dy = sy - h * 0.5f;
+                float d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; bestSign = sg; }
+            }
+            g_wSign = bestSign;
+        }
+        g_locked = 1;
+        Log("projection: draw-time capture (c4 rows, sign=%+d, fx=%.3f fy=%.3f)",
+            g_wSign, g_fx, g_fy);
+        return;
+    }
     float world[160][3];
     int n = 0;
     GatherJoints(world, &n, 160);
@@ -1117,9 +1308,9 @@ static uint8_t* g_jarr = NULL;
 static int g_jstride = 0;
 static int g_jmatoff = 0;
 
-static int MatrixNearRaw(const uint8_t* rec, int moff, const float* refPos, float maxd)
+static int MatrixNearBuf(const uint8_t* buf, int moff, const float* refPos, float maxd)
 {
-    const float* m = (const float*)(rec + moff);
+    const float* m = (const float*)(buf + moff);
     for (int i = 0; i < 16; ++i) if (!(m[i] == m[i])) return 0;
     if (fabsf(m[12]) > 2e5f || fabsf(m[13]) > 2e5f || fabsf(m[14]) > 2e5f) return 0;
     if (m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f) return 0;
@@ -1159,8 +1350,10 @@ static void FindModelJoints(void)
             for (int mi = 0; mi < 4; ++mi) {
                 int cnt = 0;
                 for (int k = 0; k < 8; ++k) {
-                    const uint8_t* rec = (const uint8_t*)(uintptr_t)v + (size_t)k * strides[si];
-                    if (!MatrixNearRaw(rec, matoffs[mi], refPos, 150.0f)) break;
+                    uint8_t rec[0x90 + 0x60];
+                    if (!SRead((uint32_t)(uintptr_t)v + (uint32_t)((size_t)k * strides[si]),
+                               rec, 0x90)) break;
+                    if (!MatrixNearBuf(rec, matoffs[mi], refPos, 150.0f)) break;
                     ++cnt;
                 }
                 if (cnt > bestCnt) { bestCnt = cnt; bestOff = off; bestStride = strides[si]; bestMat = matoffs[mi]; }
@@ -1202,7 +1395,7 @@ static int ModelJointMatrix2(uint16_t ref, float* out)
         float d = dx * dx + dy * dy + dz * dz;
         if (d < bestD) { bestD = d; memcpy(best, m, 64); found = 1; }
     }
-    if (!found || bestD > 300.0f * 300.0f) return 0;
+    if (!found || bestD > 2000.0f * 2000.0f) return 0;
     memcpy(out, best, 64);
     return 1;
 }
@@ -1266,6 +1459,8 @@ static void DumpChainOnce(void)
 static void ResetChainState(void)
 {
     g_chain = NULL;
+    g_locked = 0;              // a new level may have a different camera
+    g_useValid = 0;
     g_jblock = NULL;
     g_chainJoints = 0;
     g_chainPrims = 0;
@@ -1280,20 +1475,20 @@ static int ChainStillAlive(void)
 {
     if (!g_chain) return 0;
     if (!Readable(g_chain, 0x260)) return 0;
-    uint32_t vt = Rd32(g_chain);
+    uint32_t vt = SRd32((uint32_t)(uintptr_t)g_chain);
     if (vt != (CHAIN_VTABLE_PC + g_imgDelta) && vt != (CHAIN_VTABLE_EX + g_imgDelta)) return 0;
-    uint8_t* res = (uint8_t*)Rd32(g_chain + OFF_MPCHAIN);
-    if (!res || !Readable(res, 0x78)) return 0;
-    if (Rd32(res + 0x60) != RCHAIN_MAGIC) return 0;
+    uint32_t res = SRd32((uint32_t)(uintptr_t)g_chain + OFF_MPCHAIN);
+    if (!res || !Readable((void*)(uintptr_t)res, 0x78)) return 0;
+    if (SRd32((uint32_t)(uintptr_t)res + 0x60) != RCHAIN_MAGIC) return 0;
     return 1;
 }
 
 static void ReportPenetration(void)
 {
     if (!g_chain || g_chainJoints <= 0) return;
-    uint8_t* chainRes = (uint8_t*)Rd32(g_chain + OFF_MPCHAIN);
-    uint8_t* col = (uint8_t*)Rd32(g_chain + OFF_COLLISION);
-    uint8_t* cinfo = col ? (uint8_t*)Rd32(col + RCCOL_MPINFO) : NULL;
+    uint8_t* chainRes = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)g_chain + OFF_MPCHAIN);
+    uint8_t* col = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)g_chain + OFF_COLLISION);
+    uint8_t* cinfo = col ? (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)col + RCCOL_MPINFO) : NULL;
     if (!cinfo || g_chainPrims <= 0 || !Readable(cinfo, g_chainPrims * COLINFO_SIZE)) {
         Log("PEN: no ccl data");
         return;
@@ -1410,7 +1605,7 @@ static float ViewDepth(const float* world)
 static void EnsureProjectionSane(int W, int H)
 {
     static LONG lastCheck = -1000;
-    if (g_scOk) return;
+    if (g_scOk || g_useValid || g_locked) return;   // locked = trust the calibration
     if (g_frame - lastCheck < 30) return;
     lastCheck = g_frame;
 
@@ -1495,6 +1690,23 @@ static void DrawSegNumber(VERT* v, int* n, int maxv, int value, float x, float y
     }
 }
 
+static void LogChainDiagnostics(void)
+{
+    static uint8_t* logged = NULL;
+    if (!g_chain || logged == g_chain) return;
+    logged = g_chain;
+
+    int resolved = 0, total = 0;
+    for (int i = 0; i < g_jcacheN && i < 160; ++i) {
+        uint16_t ref = (uint16_t)SRd32((uint32_t)(uintptr_t)g_jcache[i] + JW_REFJOINT);
+        float m[16];
+        ++total;
+        if (ModelJointMatrix2(ref, m) || ModelJointMatrix(ref, m)) ++resolved;
+    }
+    Log("diag: chain=%p joints=%d prims=%d refs resolved %d/%d modelJoints=%s",
+        (void*)g_chain, g_chainJoints, g_chainPrims, resolved, total, g_jarr ? "yes" : "no");
+}
+
 static void DrawDebug(IDirect3DDevice9* dev)
 {
     if (!g_show || !g_chain || !g_camOk) return;
@@ -1508,9 +1720,10 @@ static void DrawDebug(IDirect3DDevice9* dev)
 
     Calibrate(W, H);
     EnsureProjectionSane(W, H);
+    LogChainDiagnostics();
 
-    uint8_t* chainRes = (uint8_t*)Rd32(g_chain + OFF_MPCHAIN);
-    uint8_t* info = (uint8_t*)Rd32(chainRes + RCHAIN_MPINFO);
+    uint8_t* chainRes = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)g_chain + OFF_MPCHAIN);
+    uint8_t* info = (uint8_t*)(uintptr_t)SRd32((uint32_t)(uintptr_t)chainRes + RCHAIN_MPINFO);
     int joints = g_chainJoints;
     if (joints > MAXV) joints = MAXV;
     if (!JointBase() || !Readable(info, 0x40)) return;
@@ -1527,6 +1740,22 @@ static void DrawDebug(IDirect3DDevice9* dev)
         world[count][0] = x; world[count][1] = y; world[count][2] = z;
         refs[count] = (uint16_t)Rd32(g_jcache[i] + JW_REFJOINT);
         ++count;
+    }
+
+    if (count > 0) {
+        float cx = 0, cy = 0, cz = 0;
+        int used = 0;
+        for (int i = 0; i < count; ++i) {
+            float d = fabsf(world[i][0]) + fabsf(world[i][1]) + fabsf(world[i][2]);
+            if (d < 3.0f) continue;                 // stuck at the origin
+            cx += world[i][0]; cy += world[i][1]; cz += world[i][2];
+            ++used;
+        }
+        if (used) {
+            g_centroid[0] = cx / used;
+            g_centroid[1] = cy / used;
+            g_centroid[2] = cz / used;
+        }
     }
 
     float devs[MAXV];
@@ -1552,6 +1781,15 @@ static void DrawDebug(IDirect3DDevice9* dev)
                 if (d > 25.0f)      col = 0xFFFF0000;      // red
                 else if (d > 12.0f) col = 0xFFFFFF00;      // yellow
                 else if (d > 5.0f)  col = 0xFFFFA500;      // orange
+            }
+        }
+        float manhattan = fabsf(world[i][0]) + fabsf(world[i][1]) + fabsf(world[i][2]);
+        if (manhattan < 3.0f) {
+            col = 0xFFFFFFFF;                        // white: position is the origin
+            static int originLogged = 0;
+            if (originLogged < 3) {
+                originLogged++;
+                Log("joint ref=%u sits at the world origin (bone missing in the model?)", refs[i]);
             }
         }
         AddCircle(verts, &n, MAXV, sx, sy, 4.5f, col);
@@ -1633,6 +1871,7 @@ static void DrawDebug(IDirect3DDevice9* dev)
         }
     }
 
+    int cclUnresolved = 0;
     if (g_chainPrims > 0) {
         uint32_t col = SRd32((uint32_t)(uintptr_t)g_chain + OFF_COLLISION);
         uint32_t cinfo = col ? SRd32(col + RCCOL_MPINFO) : 0;
@@ -1650,7 +1889,10 @@ static void DrawDebug(IDirect3DDevice9* dev)
                 float radius = Rdf(ci + 0x2C);
 
                 float m0[16];
-                if (!(ModelJointMatrix2(ref, m0) || ModelJointMatrix(ref, m0))) continue;
+                if (!(ModelJointMatrix2(ref, m0) || ModelJointMatrix(ref, m0))) {
+                    ++cclUnresolved;
+                    continue;
+                }
                 float c0[3];
                 Xform(m0, lp, c0);
 
@@ -1686,6 +1928,10 @@ static void DrawDebug(IDirect3DDevice9* dev)
         static int warn = 0;
         if (++warn < 5) Log("draw: %d joints but no geometry on screen (invalid sim values?)", count);
     }
+
+    if (cclUnresolved && (g_frame % 300) == 0)
+        Log("ccl: %d of %d primitives unresolved (missing bone for their ref?)",
+            cclUnresolved, g_chainPrims);
 
     if (n >= 2) {
         BeginLines(dev);
@@ -1727,9 +1973,76 @@ static void RestoreJmp(void* target, const BYTE* saved)
     FlushInstructionCache(GetCurrentProcess(), target, 5);
 }
 
+
+static void CamFromRows(const float (*m)[4], float* out)
+{
+    out[0] = -(m[0][0] * m[0][3] + m[1][0] * m[1][3] + m[2][0] * m[2][3]);
+    out[1] = -(m[0][1] * m[0][3] + m[1][1] * m[1][3] + m[2][1] * m[2][3]);
+    out[2] = -(m[0][2] * m[0][3] + m[1][2] * m[1][3] + m[2][2] * m[2][3]);
+}
+
+static HRESULT __stdcall Hook_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+                                                   INT baseVertex, UINT minIndex, UINT numVerts,
+                                                   UINT startIndex, UINT primCount)
+{
+    // Score every draw of this frame and keep the one whose implied camera looks
+    // like the third-person camera: a few metres behind the character and moving
+    // smoothly from the previous frame.  Shadow/reflection passes are far away and
+    // jump between frames, so they lose.
+    float cam[3];
+    CamFromRows((const float (*)[4])g_blocks, cam);
+    int finite = 1;
+    for (int i = 0; i < 3; ++i) if (!(cam[i] == cam[i]) || fabsf(cam[i]) > 1e6f) finite = 0;
+    float fx = g_blocks[7][0], fy = g_blocks[7][1];
+
+    if (finite && fx > 0.05f && fy > 0.05f && g_chain) {
+        // never touch chain memory from inside a draw hook: use the cached
+        // centroid only (it may be gone while the level is unloading)
+        if (g_jcacheN > 0) {
+            const float* cen = g_centroid;
+            float dx = cam[0] - cen[0], dy = cam[1] - cen[1], dz = cam[2] - cen[2];
+            float camDist = sqrtf(dx * dx + dy * dy + dz * dz);
+            float score = fabsf(camDist - 350.0f);      // typical over-the-shoulder range
+            if (g_lastCamValid) {
+                float jx = cam[0] - g_lastCam[0], jy = cam[1] - g_lastCam[1], jz = cam[2] - g_lastCam[2];
+                float jump = sqrtf(jx * jx + jy * jy + jz * jz);
+                if (jump > 150.0f) score += 1e4f;       // another pass, not this frame's camera
+                score += jump * 0.5f;                   // prefer the smoother candidate
+            }
+            if (score < g_frameBestScore) {
+                g_frameBestScore = score;
+                memcpy(g_frameBest, g_blocks, sizeof(g_frameBest));
+                memcpy(g_frameBestCam, cam, sizeof(g_frameBestCam));
+                g_frameHave = 1;
+            }
+        }
+    }
+
+    if (!g_origDrawIP) return D3DERR_INVALIDCALL;
+    return g_origDrawIP(dev, type, baseVertex, minIndex, numVerts, startIndex, primCount);
+}
+
 static HRESULT __stdcall Hook_Present(IDirect3DDevice9* dev, const RECT* src, const RECT* dst,
                                      HWND wnd, const RGNDATA* dirty)
 {
+    g_frameCaptured = 0;   // draws of the next frame may capture
+
+    if (!g_captureEnabled) g_useValid = 0;   // F9 off: use the constant-block path
+
+    if (g_captureEnabled && g_frameHave) {
+        memcpy(g_use, g_frameBest, sizeof(g_use));
+        memcpy(g_lastCam, g_frameBestCam, sizeof(g_lastCam));
+        g_lastCamValid = 1;
+        g_useValid = 1;
+        float dx = g_lastCam[0] - g_centroid[0];
+        float dy = g_lastCam[1] - g_centroid[1];
+        float dz = g_lastCam[2] - g_centroid[2];
+        g_useCamDist = sqrtf(dx * dx + dy * dy + dz * dz);
+        g_frameHave = 0;
+        g_frameBestScore = 1e9f;
+    }
+
+    g_frameCaptured = 0;   // draws of the next frame may capture once
     InterlockedIncrement(&g_frame);
     static LARGE_INTEGER freq = { 0 }, prev = { 0 };
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
@@ -1758,6 +2071,18 @@ static HRESULT __stdcall Hook_Present(IDirect3DDevice9* dev, const RECT* src, co
     if (f8 && !prevF8) { g_strandDbg = !g_strandDbg; Log("strand debug=%d", g_strandDbg); }
     prevF8 = f8;
 
+    static int prevF9 = 0;
+    int f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9 && !prevF9) {
+        g_captureEnabled = !g_captureEnabled;
+        g_useValid = 0;
+        g_locked = 0;
+        g_useCamDist = 1e9f;
+        g_lastCamValid = 0;
+        Log("draw-time capture=%d (takes effect on the next device reset)", g_captureEnabled);
+    }
+    prevF9 = f9;
+
     if (g_candN > 0 && (g_frame % 120) == 0) PickNearestChain();
     {
         static int badFrames = 0;
@@ -1766,6 +2091,9 @@ static HRESULT __stdcall Hook_Present(IDirect3DDevice9* dev, const RECT* src, co
                 Log("chain gone for 120 frames, resetting");
                 badFrames = 0;
                 ResetChainState();
+                g_lastCamValid = 0;
+                g_useValid = 0;
+                g_useCamDist = 1e9f;
                 if (!g_scanRunning) CreateThread(NULL, 0, ScanThread, NULL, 0, NULL);
             }
         } else {
@@ -1781,9 +2109,13 @@ static HRESULT __stdcall Hook_Present(IDirect3DDevice9* dev, const RECT* src, co
         ReportPenetration();
     if (g_chain && (g_frame % 300) == 0) {
         LogModelDiag();
+        uint8_t tail[0x10];
+        int tailOk = SRead((uint32_t)(uintptr_t)g_chain + 0x220, tail, sizeof(tail));
         Log("ccl: jmat=%08X ncol=%u enable=%u work=%08X",
-            Rd32(g_chain + g_offCJ), Rd32(g_chain + OFF_COLINFONUM),
-            (unsigned)(g_chain[0x228] & 0xFF), Rd32(g_chain + 0x224));
+            SRd32((uint32_t)(uintptr_t)g_chain + g_offCJ),
+            SRd32((uint32_t)(uintptr_t)g_chain + OFF_COLINFONUM),
+            tailOk ? (unsigned)tail[0x08] : 0u,
+            SRd32((uint32_t)(uintptr_t)g_chain + 0x224));
     }
     {
         LARGE_INTEGER f2, a, b;
@@ -1805,6 +2137,10 @@ static HRESULT __stdcall Hook_Reset(IDirect3DDevice9* dev, void* params)
 {
     Log("device reset - dropping cached chain");
     g_chain = NULL;
+    g_useValid = 0;
+    g_frameHave = 0;
+    g_frameBestScore = 1e9f;
+    g_lastCamValid = 0;
     g_jcacheN = 0;
     g_jcacheFrame = -100000;
     g_jarr = NULL;
@@ -1853,6 +2189,9 @@ static HRESULT __stdcall Hook_CreateDevice(IDirect3D9* d3d, UINT adapter, DWORD 
         g_origEndScene = (PFN_EndScene)PatchVtable(dev, 42, (void*)Hook_EndScene);
         g_origPresent = (PFN_Present)PatchVtable(dev, 17, (void*)Hook_Present);
         g_origReset = (PFN_Reset)PatchVtable(dev, 16, (void*)Hook_Reset);
+        // draw-time capture is disabled: installing DrawIndexedPrimitive paired with
+        // level unload reproduced a crash.  The code is kept for future work.
+        (void)Hook_DrawIndexedPrimitive;
         g_origSetVSConstF = (PFN_SetVSConstF)PatchVtable(dev, 94, (void*)Hook_SetVSConstF);
         Log("device %p hooked EndScene=%p SetVSConstF=%p", (void*)dev,
             (void*)g_origEndScene, (void*)g_origSetVSConstF);
@@ -1890,6 +2229,9 @@ static DWORD WINAPI Install(LPVOID)
 BOOL APIENTRY DllMain(HMODULE hmod, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
+        InitCrashProbe(hmod);
+        InitializeCriticalSection(&g_logCs);
+        g_logCsInit = 1;
         DisableThreadLibraryCalls(hmod);
         g_log = OpenLog();
         Log("re5_chaindbg v2 loaded");

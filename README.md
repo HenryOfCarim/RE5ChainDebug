@@ -86,6 +86,8 @@ No D3DX, no ImGui, no runtime dependencies beyond `d3d9.dll`/`kernel32`.
 | `chain gone for 120 frames, resetting` | level unloaded; state reset and scanner restarted |
 | `device reset - dropping cached chain` | `IDirect3DDevice9::Reset` cleared caches |
 | `draw: N joints but no geometry on screen` | the chain currently holds invalid (NaN) values |
+| `CRASH code=… addr=… (asi+0x…/game+0x…)` | fatal exception, with the faulting module and offset + a return-address trace |
+| `FIRSTCHANCE …` | an access violation inside this ASI that the game swallowed (early warning) |
 
 ## How it works (short version)
 
@@ -100,11 +102,17 @@ No D3DX, no ImGui, no runtime dependencies beyond `d3d9.dll`/`kernel32`.
    **model bone**, found structurally (`uModel + 0x318`, stride `0x90`, matrix `+0x50`,
    function id at byte `+0x07`). `mpColJointWMat` is null on PC, so chain-side matrices are
    not usable.
-5. The camera is read from the vertex shader constant blocks (`c4..c6` view, `c7/c8`
-   projection) with a one-shot calibration and a per-frame sanity guard. Drawing happens in
-   `Present`, once per frame (`EndScene` is called several times per frame in RE5).
+5. The camera is snapshotted **inside `DrawIndexedPrimitive`**: at that moment the shader
+   constants belong to that draw, so the main pass can be identified by camera continuity
+   (a third-person camera never teleports between frames; shadow/reflection passes do).
+   If no draw is captured, the tool falls back to the end-of-frame constant blocks with a
+   calibration and a per-frame sanity guard. Drawing happens in `Present`, once per frame
+   (`EndScene` is called several times per frame in RE5).
 6. Everything that can disappear with the level is read through `ReadProcessMemory`, so an
-   unloaded level returns errors instead of crashing the game.
+   unloaded level returns errors instead of crashing the game. The log critical section is
+   initialised in `DllMain` (a lazy init raced with the scanner thread and corrupted the
+   heap). A vectored exception handler records fatal and swallowed exceptions with a stack
+   trace, which is how the remaining crash was tracked down.
 
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 The `.chn` format and every tuning parameter: [docs/CHN_FORMAT.md](docs/CHN_FORMAT.md).
@@ -137,6 +145,12 @@ The `.chn` format and every tuning parameter: [docs/CHN_FORMAT.md](docs/CHN_FORM
 - The projection calibration may flip convention in an unusual scene; the sanity guard
   corrects it, but a single frame may jump.
 - Short strands (2–3 joints) cannot drape: the simulation treats them as levers.
+- Some characters (both Chris costumes in testing) have no discoverable model joint array
+  (`diag: … modelJoints=no`, `refs resolved 0/N`), so their CCL primitives cannot be placed.
+  Chris has no CCL at all, so nothing is lost there.
+- A joint whose `ref_joint_no` does not exist in the model is left at the world origin by the
+  engine. It is drawn white and logged (`joint ref=N sits at the world origin`), and it is
+  excluded from the calibration cloud so it cannot skew the projection.
 
 ## Repository layout
 

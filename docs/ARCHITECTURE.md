@@ -75,6 +75,25 @@ Each `ColInfo` (0x40 bytes at `rChainCol + 0x70`) is transformed by the matrix o
 
 ## 4. Camera and projection
 
+### Draw-time capture (primary source)
+
+`IDirect3DDevice9::DrawIndexedPrimitive` (vtable 82) is hooked. At the moment of a draw, the
+shader constants that were uploaded last belong to **that** draw, so a snapshot taken there
+is the real matrix set of the pass being recorded - no guessing from the end of the frame.
+
+- one snapshot per frame (the first qualifying draw after the previous `Present`);
+- the candidate is accepted only if the camera it implies **continues** the previous frame's
+  camera (jump < 60 cm). Shadow, reflection and post passes teleport the camera, so they are
+  rejected;
+- the accepted snapshot (`g_use`) is used for projection during the following `Present`;
+- calibration then only has to pick the handedness, which is done once with the
+  screen-centre prior.
+
+### Fallback: constant-block calibration
+
+If `DrawIndexedPrimitive` is never captured (different driver, overlay loaded late, etc.) the
+tool falls back to the end-of-frame constant blocks:
+
 The engine uploads the view matrix several times per frame (main pass, shadow, reflection,
 post). The tool captures the **last** upload of each constant register per frame, then:
 
