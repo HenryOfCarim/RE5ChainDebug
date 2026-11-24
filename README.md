@@ -41,7 +41,8 @@ rest pose, and the ids (`ref_joint_no`) of the worst joints are drawn next to th
 1. Copy `re5_chaindbg.asi` next to the ASI loader (not necessarily the game folder —
    wherever your loader picks ASI files up).
 2. Start the game and load into a **level** (no chains exist in the main menu).
-3. Press **F7** to toggle the overlay, **F8** to toggle diagnostics.
+4. Wait until the red square indicator turns green (character movement during this period can negatively affect the result)
+5. Press **F7** to toggle the overlay, **F8** to toggle diagnostics.
 
 Log file: `re5_chaindbg.log` next to `re5dx9.exe`, otherwise in `%TEMP%`.
 
